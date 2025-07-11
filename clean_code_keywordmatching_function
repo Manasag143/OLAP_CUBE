@@ -1,0 +1,819 @@
+import logging
+import time
+import json
+import os
+import requests
+import yaml
+from datetime import date
+from colorama import Fore, Style, init
+from typing import Dict, List, Tuple, Optional
+
+from langchain_core.documents import Document
+from langchain_community.vectorstores.chroma import Chroma
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_openai import AzureChatOpenAI
+from langchain_community.callbacks import get_openai_callback
+from langchain.prompts import PromptTemplate
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CUBE_DETAILS_DIR = os.path.join(BASE_DIR, "cube_details")
+IMPORT_HISTORY_FILE = os.path.join(BASE_DIR, "import_history.json")
+history_file = os.path.join(BASE_DIR, "conversation_history.json")
+vector_db_path = os.path.join(BASE_DIR, "vector_db")
+config_file = os.path.join(BASE_DIR, "config.json")
+
+def load_documents_from_json(cube_id: str, doc_type: str, base_dir: str) -> List[Document]:
+    """Load documents from JSON file"""
+    try:
+        file_path = os.path.join(base_dir, cube_id, f"{cube_id}_{doc_type}.json")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Cube data doesn't exist")
+            
+        with open(file_path) as f:
+            data = json.load(f)
+            
+        # Convert to Document objects
+        documents = []
+        for doc in data:
+            content = f"Group Name:{doc['Group Name']}--Level Name:{doc['Level Name']}--Description:{doc['Description']}"
+            documents.append(Document(page_content=content))
+        return documents
+            
+    except Exception as e:
+        logging.error(f"Error loading {doc_type} documents: {str(e)}")
+        raise
+
+def setup_logging():
+    """Store errors in log folder datewise and token consumptions."""
+    today = date.today()
+    log_folder = './log'
+  
+    if not os.path.exists(log_folder):
+        os.mkdir(log_folder)
+    
+    logging.basicConfig(
+        filename=f"{log_folder}/{today}.log",
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+class SmartFunctionsManager:
+    """
+    Manages OLAP functions with smart selection based on query analysis
+    """
+    
+    def __init__(self, functions_file: str = "olap_functions.yaml"):
+        self.functions_file = functions_file
+        self.functions_library = self._load_functions_library()
+        
+    def _load_functions_library(self) -> Dict:
+        """Load functions from YAML file"""
+        try:
+            with open(self.functions_file, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"? Functions file {self.functions_file} not found! Please create the YAML file.")
+            raise FileNotFoundError(f"Required file {self.functions_file} is missing. Please create it.")
+        except Exception as e:
+            logging.error(f"? Error loading functions file: {e}")
+            raise
+    
+    def _analyze_query_intent(self, query: str) -> List[str]:
+        """Analyze query to determine which function categories are needed"""
+        query_lower = query.lower()
+        needed_categories = []
+        
+        time_keywords = ["between", "range", "from", "to", "year", "month", "date", 
+                         "yoy", "mom", "trend", "previous", "next", "change", "growth"]
+        if any(keyword in query_lower for keyword in time_keywords):
+            needed_categories.append("time_functions")
+
+        ranking_keywords = ["top", "bottom", "best", "worst", "highest", "lowest", 
+                           "first", "last", "rank", "maximum", "minimum"]
+        if any(keyword in query_lower for keyword in ranking_keywords):
+            needed_categories.append("ranking_functions")
+
+        conditional_keywords = ["where", "if", "when", "only", "filter", "exclude", 
+                               "condition", "greater", "less", "equal"]
+        if any(keyword in query_lower for keyword in conditional_keywords):
+            needed_categories.append("conditional_functions")
+
+        agg_keywords = ["sum", "total", "average", "count", "percentage", "%", 
+                       "cumulative", "running"]
+        if any(keyword in query_lower for keyword in agg_keywords):
+            needed_categories.append("aggregation_functions")
+
+        comp_keywords = ["in", "like", "contains", "not"]
+        if any(keyword in query_lower for keyword in comp_keywords):
+            needed_categories.append("comparison_functions")
+
+        math_keywords = ["greater", "less", "above", "below", "more", "exceeds"]
+        if any(keyword in query_lower for keyword in math_keywords):
+            needed_categories.append("mathematical_operations")
+
+        needed_categories.append("utility_functions")
+        
+        # If no specific functions detected, include all (fallback)
+        if len(needed_categories) == 1:  # Only utility
+            needed_categories = list(self.functions_library.keys())
+        
+        return needed_categories
+
+    def build_dynamic_functions_section(self, query: str) -> str:
+        """Build functions section with only relevant functions"""
+        needed_categories = self._analyze_query_intent(query)
+        functions_text = "<functions>\n"
+        
+        for category in needed_categories:
+            if category in self.functions_library:
+                category_funcs = self.functions_library[category]
+                
+                # Add category header
+                category_name = category.replace("_", " ").title()
+                functions_text += f"\n## {category_name}:\n"
+                
+                # Add each function in this category
+                for func_name, func_info in category_funcs.items():
+                    functions_text += f"- {func_name}: {func_info['syntax']}\n"
+                    functions_text += f"  Example: {func_info['example']}\n"
+                    if 'use_case' in func_info:
+                        functions_text += f"  Use: {func_info['use_case']}\n"
+        
+        functions_text += "</functions>"
+        
+        # Log optimization metrics
+        total_functions = sum(len(funcs) for funcs in self.functions_library.values())
+        selected_functions = sum(len(self.functions_library[cat]) for cat in needed_categories if cat in self.functions_library)
+        logging.info(f"Function optimization: Using {selected_functions}/{total_functions} functions ({(selected_functions/total_functions)*100:.1f}%)")
+        
+        return functions_text
+
+class LLMConfigure:
+    """Class responsible for loading and configuring LLM and embedding models from a config file."""
+
+    def __init__(self, config_path: str = "config.json"):
+        self.config = self.load_config(config_path)
+        self.llm = None
+        self.embedding = None
+
+    def load_config(self, config_path: str) -> Dict:
+        """Loads the config from a JSON file."""
+        try:
+            with open(config_path, 'r') as config_file:
+                config = json.load(config_file)
+                return config
+        except FileNotFoundError as e:
+            logging.error(f"Config file not found: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logging.error(f"Error parsing the config file: {e}")
+            raise
+
+    def initialize_llm(self):
+        """Initializes and returns the LLM model."""
+        try:
+            self.llm = AzureChatOpenAI(
+                openai_api_key=self.config['llm']['OPENAI_API_KEY'],
+                model=self.config['llm']['model'],
+                temperature=self.config['llm']['temperature'],
+                api_version=self.config['llm']["OPENAI_API_VERSION"],
+                azure_endpoint=self.config['llm']["AZURE_OPENAI_ENDPOINT"],
+                seed=self.config['llm']["seed"]
+            )
+            return self.llm
+        except KeyError as e:
+            logging.error(f"Missing LLM configuration in config file: {e}")
+            raise
+
+    def initialize_embedding(self):
+        """Initializes and returns the Embedding model."""
+        try:
+            self.embedding = AzureOpenAIEmbeddings(
+                deployment=self.config['embedding']['deployment'],
+                azure_endpoint=self.config['llm']["AZURE_OPENAI_ENDPOINT"],
+                openai_api_key=self.config['llm']['OPENAI_API_KEY'],
+                show_progress_bar=self.config['embedding']['show_progress_bar'],
+                disallowed_special=(),
+                openai_api_type=self.config['llm']['OPENAI_API_TYPE']
+            )
+            return self.embedding
+        except KeyError as e:
+            logging.error(f"Missing embedding configuration in config file: {e}")
+            raise
+
+class DimensionMeasure:
+    """Class responsible for extracting dimensions and measures from the natural language query."""
+
+    def __init__(self, llm: str, embedding: str, vectorstore: str):
+        self.llm = llm
+        self.embedding = embedding
+        self.vector_embedding = vectorstore
+
+    def get_dimensions(self, query: str, cube_id: str, prev_conv: dict) -> str:
+        """Extracts dimensions from the query."""
+        try:
+            with get_openai_callback() as dim_cb:
+                query_dim = """ 
+                As an SQL CUBE query expert, analyze the user's question and identify all relevant cube dimensions from the dimensions delimited by ####.
+                
+                <instructions>
+                - Select relevant dimension group, level, description according to user query from dimensions list delimited by ####
+                - format of one dimension: Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description> 
+                - Include all dimensions relevant to the question in the response
+                - Group Name and Level Name can never be same, extract corresponding group name for a selected level name according to the user query and vice versa.
+                - If relevant dimensions group and level are not present in the dimensions list, please return "Not Found"
+                - If the query mentions date, year, month ranges, include corresponding dimensions in the response  
+                </instructions>
+                
+                Response format:
+                Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description>
+
+                Review:
+                - ensure dimensions are only selected from dimensions list delimited by ####
+                - Group Name and Level Name can never be same, extract corresponding group name, description for a selected level name according to the user query and vice versa.
+                - Kindly ensure that the retrieved dimensions group name and level name is present otherwise return "Not found".
+
+                User Query: {question}
+                ####
+                {context}
+                ####
+                """
+
+                print(Fore.RED + '    Identifying Dimensions group name and level name......................\n')
+                
+                # Load documents from JSON
+                documents = load_documents_from_json(cube_id, "dimensions", vector_db_path)
+                
+                # Initialize BM25 retriever
+                bm25_retriever = BM25Retriever.from_documents(documents, k=10)
+                    
+                # Set up vector store directory
+                cube_dir = os.path.join(vector_db_path, cube_id)
+                cube_dim = os.path.join(cube_dir, "dimensions")
+                
+                load_embedding_dim = Chroma(persist_directory=cube_dim, embedding_function=self.embedding)
+                vector_retriever = load_embedding_dim.as_retriever(search_type="similarity", search_kwargs={"k": 20})
+
+                # Create ensemble retriever
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.5, 0.5]
+                )
+                
+                # Initialize and run QA chain
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    retriever=ensemble_retriever,
+                    return_source_documents=True,
+                    verbose=True,
+                    chain_type_kwargs={
+                        "prompt": PromptTemplate(
+                            template=query_dim,
+                            input_variables=["query", "context"]
+                        ),
+                        "verbose": True
+                    }
+                )
+
+                # Get results
+                result = qa_chain({"query": query, "context": ensemble_retriever})
+                dim = result['result']
+                print(Fore.GREEN + '    Identified Group and level name :        ' + str(dim))
+                logging.info(f"Extracted dimensions :\n {dim}")
+                return dim
+
+        except Exception as e:
+            logging.error(f"Error extracting dimensions : {e}")
+            raise
+
+    def get_measures(self, query: str, cube_id: str, prev_conv: dict) -> str:
+        """Extracts measures from the query."""
+        try:
+            with get_openai_callback() as msr_cb:
+                query_msr = """ 
+                As an SQL CUBE query expert, analyze the user's question and identify all relevant cube measures from the measures delimited by ####.
+                
+                <instructions>
+                - Select relevant measure group, level, description according to user query from measures list delimited by ####
+                - format of one measure: Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description> 
+                - Include all measures relevant to the question in the response
+                - Group Name and Level Name can never be same, extract corresponding group name for a selected level name according to the user query and vice versa.
+                - If relevant measures are not present in the measures list, please return "Not Found" 
+                </instructions>
+
+                Response format:
+                Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description>
+
+                Review:
+                - Ensure measures are only selected from measures list delimited by ####
+                - Group Name and Level Name can never be same, extract corresponding group name, description for a selected level name according to the user query and vice versa.
+                - Kindly ensure that the retrieved measures group name and level name is present otherwise return "Not found".
+
+                User Query: {question}
+                ####
+                {context}
+                ####
+                """
+
+                print(Fore.RED + '    Identifying Measure group name and level name......................\n')
+                
+                # Load documents from JSON
+                documents = load_documents_from_json(cube_id, "measures", vector_db_path)
+                
+                bm25_retriever = BM25Retriever.from_documents(documents, k=10)
+
+                cube_msr = os.path.join(vector_db_path, cube_id, "measures")
+                load_embedding_msr = Chroma(persist_directory=cube_msr, embedding_function=self.embedding)
+                vector_retriever = load_embedding_msr.as_retriever(search_type="similarity", search_kwargs={"k": 20})
+                
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.5, 0.5]
+                )
+
+                # Run QA chain with ensemble retriever
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    retriever=ensemble_retriever,
+                    return_source_documents=True,
+                    verbose=True,
+                    chain_type_kwargs={
+                        "prompt": PromptTemplate(
+                            template=query_msr,
+                            input_variables=["query", "context"]
+                        ),
+                        "verbose": True
+                    }
+                )
+                
+                result = qa_chain({"query": query, "context": ensemble_retriever})
+                msr = result['result']
+
+                print(Fore.GREEN + '    Measures result :        ' + str(result)) 
+                logging.info(f"Extracted measures :\n {msr}")  
+                return msr
+        
+        except Exception as e:
+            logging.error(f"Error Extracting Measure: {e}")
+            raise
+
+class FinalQueryGenerator(LLMConfigure):
+    """Class responsible for generating the final OLAP query based on dimensions and measures."""
+    
+    def __init__(self, query, dimensions: None, measures: None, llm: None):
+        super().__init__()
+        self.query = query
+        self.dimensions = dimensions
+        self.measures = measures
+        self.llm = llm
+        self.functions_manager = SmartFunctionsManager()
+        
+    def call_gpt(self, final_prompt: str):
+        """Function responsible for generating final query"""
+        API_KEY = self.config['llm']['OPENAI_API_KEY']
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": API_KEY,
+        }
+        
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You are an AI assistant that writes accurate OLAP cube queries based on given query."
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": final_prompt
+                        }
+                    ]
+                }
+            ],
+            "temperature": self.config['llm']['temperature'],
+            "top_p": self.config['llm']['top_p'],
+            "max_tokens": self.config['llm']['max_tokens']
+        }
+        
+        ENDPOINT = self.config['llm']['ENDPOINT']
+        
+        try:
+            response = requests.post(ENDPOINT, headers=headers, json=payload)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise SystemExit(f"Failed to make the request. Error: {e}")
+        
+        output = response.json()
+        token_details = output['usage']
+        output = output["choices"][0]["message"]["content"]
+        return output, token_details
+
+
+    def generate_query(self, query: str, dimensions: str, measures: str, prev_conv: dict, cube_name: str) -> str:
+
+        try:
+            if not dimensions or not measures:
+                raise ValueError("Both dimensions and measures are required to generate a query.")
+            
+            dynamic_functions = self.functions_manager.build_dynamic_functions_section(query)
+            logging.info(f"QUERY_GENERATION_FUNCTIONS - Dynamic functions loaded for query analysis")
+                
+            final_prompt = f"""You are an expert in generating SQL Cube query. You will be provided dimensions delimited by $$$$ and measures delimited by &&&&.
+            Your Goal is to generate a precise single line cube query for the user query delimited by ####.
+
+
+            Instructions:            
+            - Generate a single-line Cube query without line breaks
+            - Include 'as' aliases for all level names in double quotes. alias are always level names.
+            - Choose the most appropriate dimensions group names and level from dimensions delimited by $$$$ according to the query.
+            - Choose the most appropriate measures group names and level from measures delimited by &&&& according to the query.
+            - check the examples to learn about correct syntax, functions and filters which can be used according to the user query requirement.
+            - User Query could be a follow up query in a conversation, you will also be provided previous query, dimensions, measures, cube query. Generate the final query including the contexts from conversation as appropriate.
+
+            Formatting Rules:
+            - Dimensions format: [Dimension Group Name].[Dimension Level Name] as "Dimension Level Name"
+            - Measures format: [Measure Group Name].[Measure Level Name] as "Measure Level Name"
+            - Conditions in WHERE clause must be properly formatted with operators
+            - For multiple conditions, use "and" "or" operators
+            - All string values in conditions must be in single quotes
+            - All numeric values should not have leading zeros
+            
+            {dynamic_functions}
+
+            <examples>
+
+            user query:What is the Total Revenue and Total Revenue From Operations Between the year 2012 to 2017?
+            Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20120101,20171231,[Time].[Year], false) from [Cube].[{cube_name}]
+	    
+	    user query:Mutual Fund Name wise Trade Price & Quantity ?
+  	    Expected Response:select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price", [Bulk Deal Trade].[Traded Quantity] as "Traded Quantity" from [Cube].[{cube_name}]
+
+            user query:-Which months has the value of balance average amount between 40,00,00,000 to 2,00,00,00,000 ?           
+            Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] between 400000000.00 and 2000000000.00
+
+            user query:-Top 5 Cities on Average Balance Amount.
+            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average",Head([Branch Details].[City],[Business Drivers].[Balance Amount Average],5,undefined) from [Cube].[{cube_name}]
+
+            user query:-Please provide Cities and Average Balance Amount where Average Balance Amount is more than 5000 and Count of Customers more than 10.
+            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Count of Customers] > 10.00 and [Business Drivers].[Balance Amount Average] > 5000.00
+
+            user query:-what is the count of customers based on rating ?
+            Expected Response:-select [External Funding].[Rating] as "Rating", [Business Drivers].[Count of Customers] as "Count of Customers" from [Cube].[{cube_name}]
+
+            user query:-Please provide Year and Average Balance Amount and % change from previous year for past 2 years
+            Expected Response:-select [Time].[Year] as "Year", [Business Drivers].[Balance Amount Average] as "Balance Amount Average", TrendNumber([Business Drivers].[Balance Amount Average],[Time].[Year],2,'percentage') as "YOY % Change" from [Cube].[{cube_name}]
+
+            user query:-What is the closing price of Industry ?
+            Expected Response:-select [Industry Details].[Industry Name] as "Industry Name", [Share Price BSE].[Close Price] as "Close Price" from [Cube].[{cube_name}]
+
+            user query:-Which are the bottom 4 years having lowest total revenue from operation ?
+            Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",Tail([Time].[Year],[Financial Data].[Total Revenue From Operations],4,undefined) from [Cube].[{cube_name}]
+
+            user query:-What are the closing price of AXIS, HDFC, ICICI & LIC Mutual Funds ?
+            Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Share Price BSE].[Close Price] as "Close Price" from [Cube].[{cube_name}] where [Mutual Fund Investment].[Mutual Fund Name] in ('AXIS','HDFC','ICICI','LIC')
+
+            user query:-What are the Cash Ratio Current Ratio and Quick Ration Based on Month from 2012 to 2017 ? 
+            Expected Response:-select [Time].[Month] as "Month", [Financial Ratios].[Cash Ratio] as "Cash Ratio", [Financial Ratios].[Current Ratio] as "Current Ratio", 
+            [Financial Ratios].[Quick Ratio] as "Quick Ratio",TimeBetween(20120101,20171231,[Time].[Month], false) from [Cube].[{cube_name}]
+
+            user query:-Provide Current Ratio, Cash Ratio, and Quick ration segregated by industry group?
+            Expected Response:-select [Industry Details].[Industry Group Name] as "Industry Group Name", [Financial Ratios].[Current Ratio] as "Current Ratio", [Financial Ratios].[Cash Ratio] as "Cash Ratio", [Financial Ratios].[Quick Ratio] as "Quick Ratio" from [Cube].[{cube_name}]
+
+            user query:-Provide the Year and Total Revenue and Value of Previous Year.
+            Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", 
+            TrendNumber([Financial Data].[Total Revenue],[Time].[Year],1,'value') as "Trend 1" from [Cube].[{cube_name}]
+
+            user query:-Provide the Quarter wise %Change from Previous year for Total Revenue.
+            Expected Response:-select [Time].[Quarter] as "Quarter", [Financial Data].[Total Revenue] as "Total Revenue", TrendNumber([Financial Data].[Total Revenue],[Time].[Quarter],1,'percentage') as "Trend" from [Cube].[{cube_name}]
+
+            user query:-What are the Bottom 4 state based on Total Debit ?
+            Expected Response:-select [Branch Details].[State] as "State", [Financial Data].[Total Debit] as "Total Debit",Tail([Branch Details].[State],[Financial Data].[Total Debit],4,undefined) from [Cube].[{cube_name}]
+
+            user query:-Which Mutual Funds have the trade price greater than 272 but less than 276 ?
+            Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price" from [Cube].[{cube_name}] where [Bulk Deal Trade].[Trade Price] < 276.00 and [Bulk Deal Trade].[Trade Price] > 272.00
+
+            user query:-What is the Balance Amount for Mutual funds other than HDFC,SBI,Nippon,HSBC,ICICI,IDFC,AXIS ?
+            Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount" from [Cube].[{cube_name}] where [Mutual Fund Investment].[Mutual Fund Name] not in ('SBI','Nippon','HDFC','HSBC','ICICI','IDFC','AXIS')
+
+            user query:-What is the total revenue from operation between March 2015 to September 2018 ?
+            Expected Response:-select [Time].[Month] as "Month", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20150301,20180930,[Time].[Month], false) from [Cube].[{cube_name}]
+
+            user query:-What is the % of Running Sum of Balance amount with respect to Mutual Fund.
+            Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount", 
+            percentageofrunningsum([Business Drivers].[Balance Amount],'percentagerunningsumacrossrows') as "% of Running sum of Balance Amount" from [Cube].[{cube_name}]
+                        
+            user query:-Provide the Close price of Index Nifty and Sensex based on Index Name that doesn't contains "Nifty".
+            Expected Response:-select [Benchmark Index Details].[Index Name] as "Index Name", [Benchmark Index].[Index Close Price] as "Index Close Price", [Benchmark Index].[NIFTY 500] as "NIFTY 500", [Benchmark Index].[SENSEX 50] as "SENSEX 50" from [Cube].[{cube_name}] where [Benchmark Index Details].[Index Name] not like '%Nifty%'. 
+
+            user query:-Provide the list of months not having the balance average amount between 40,00,00,000 to 2,00,00,00,000.               
+            Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] not between 400000000.00 and 2000000000.00
+
+            user query:-Provide the Month wise Balance Amount with Mutual Fund Name with Balance Amount.
+            Expected Response:-select [Time].[Month] as "Month", [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount" from [Cube].[{cube_name}]
+
+            user query:-Provide the Close price of Index Nifty and Sensex based on Index Name that contains "Nifty".
+            Expected Response:-select [Benchmark Index Details].[Index Name] as "Index Name", [Benchmark Index].[Index Close Price] as "Index Close Price", [Benchmark Index].[NIFTY 500] as "NIFTY 500", [Benchmark Index].[SENSEX 50] as "SENSEX 50" from [Cube].[{cube_name}] where [Benchmark Index Details].[Index Name] like '%Nifty%' 
+
+            user query:-What is the Month vise Total Revenue and Total Debit between 1st Jan 2014 to 31st Dec 2019 ?
+            Expected Response:-select [Time].[Month] as "Month", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Debit] as "Total Debit",TimeBetween(20140101,20191231,[Time].[Month], false) from [Cube].[{cube_name}]
+
+            user query:-Show me the Customer Name and Mutual Fund Name with Balance Amount Greater than 0 and Balance Average Amount with % of Balance Amount.
+            Expected Response:-select [Customer Details].[Customer Name] as "Customer Name", [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount", [Business Drivers].[Balance Amount Average] as "Balance Amount Average", percentage([Business Drivers].[Balance Amount],'percentColumn') as "% of Balance Amount" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount] > 0.00
+
+            user query:-Kindly provide Region wise Industry wise count of customers with HIGH Risk  for 15 Jan 2025
+            Expected Response:-select [Customer Details].[Region] as "Region", [Customer Details].[Industry] as "Industry", [Customer Details].[Count of Customers] as "Count of Customers" from [Cube].[{cube_name}] where [Customer Details].[EWS Tag] = 'HIGH' and [Time].[Day] = '2025-01-15'
+
+            user query:-Provide the Mutual Fund and their Quantity along with Month on Month Quantity and Quarter on Quarter Quantity.
+            Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Fund Investment Details].[Mutual Fund Quantity] as "Mutual Fund Quantity", [Fund Investment Details].[Mutual Fund Quantity MoM] as "Mutual Fund Quantity MoM", [Fund Investment Details].[Mutual Fund Quantity QoQ] as "Mutual Fund Quantity QoQ" from [Cube].[{cube_name}]
+    
+            </examples>
+
+            <final review>
+            - ensure if the query has been generated with dimensions and measures extracted only from the current and previous conversation
+            - check if functions and filters have been used appropriately in the final cube query, ensure generated query contains filters and functions from given supported functions only
+            - review the syntax of the final cube query, refer the examples to help with the review for syntax check, functions and filters usage
+            </final review>
+
+
+            User Query: ####{query}####
+            
+            $$
+            Dimensions: {dimensions}
+            $$
+
+            &&&&
+            Measures: {measures}
+            &&&&
+
+            Generate a precise single-line Cube query that exactly matches these requirements:"""
+
+            print(Fore.CYAN + '   Generating OLAP cube Query......................\n')
+            result = self.llm.invoke(final_prompt)
+            output = result.content
+            pred_query = self.cleanup_gen_query(output)
+            print(f"{pred_query}")
+            
+            logging.info(f"Generated OLAP Query: {pred_query}")
+            return pred_query
+        
+        except Exception as e:
+            logging.error(f"Error generating OLAP query: {e}")
+            raise
+    
+    def cleanup_gen_query(self, pred_query):
+        pred_query = pred_query.replace("```sql", "").replace("\n", "").replace("```", "")
+        check = pred_query.replace("```", "")
+        final_query = check.replace("sql", "")
+        return final_query
+
+class ConversationalQueryGenerator(LLMConfigure):
+    def __init__(self, query, dimensions: None, measures: None, llm: None):
+        super().__init__()
+        self.query = query
+        self.dimensions = dimensions
+        self.measures = measures
+        self.llm = llm
+        self.functions_manager = SmartFunctionsManager()
+
+    def generate_query(self, query: str, dimensions: str, measures: str, prev_conv: dict, cube_name: str) -> str:
+        """Generate query using conversation context by preserving and extending existing query."""
+        try:
+            if not dimensions or not measures:
+                raise ValueError("Both dimensions and measures are required to generate a query.")
+                
+            prev_cube_query = prev_conv.get("response", "")
+
+            if not prev_cube_query:  # If no previous query, generate new one
+                final_query_generator = FinalQueryGenerator(query, dimensions, measures, self.llm)
+                return final_query_generator.generate_query(query, dimensions, measures, prev_conv, cube_name)
+
+            # Get previous conversation elements
+            prev_query = prev_conv.get("query", "")
+            combined_context = f"{prev_query} {query}"
+            dynamic_functions = self.functions_manager.build_dynamic_functions_section(combined_context)
+                
+            final_prompt = f"""You are an SQL Cube query expert tasked with EXTENDING an existing query based on new requirements.
+
+BASE QUERY (This query must be preserved, modified according to new user query): 
+{prev_cube_query}
+
+New User query: {query}
+New Dimensions: {dimensions}
+New Measures: {measures}
+
+CRITICAL INSTRUCTIONS:
+1. START with the base query - it must be preserved exactly as is
+2. ONLY ADD/Remove corresponding new dimensions/measures that are specifically requested in the new user query
+3. DO NOT remove or modify any existing dimensions or measures unless explicitly requested
+4. Keep all existing WHERE clauses, filters, and functions from the base query
+5. Only add new conditions if specifically mentioned in the new query
+6. Maintain the exact same syntax and formatting as the base query
+7. Remove all filters when asked, remove all filters like WHERE clause, Head/Tail, IF, Function, percentage, runningsum
+8. Use - TrendNumber:- for year-over-year/period comparisons, TimeBetween:- for data between year range, use TrendNumber and TimeBetween both as mentioned in query
+9. Check if the Dimensions and measures relate to the new user query, modify the base query for only those new dimensions/measures specifically mentioned in the new user query
+10. When asked to remove, only remove what is asked don't add any measures/dimensions.
+
+{dynamic_functions}
+
+<examples>
+
+user query:Mutual Fund Name wise Trade Price & Quantity ?
+Expected Response:select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price", [Bulk Deal Trade].[Traded Quantity] as "Traded Quantity" from [Cube].[{cube_name}]
+
+user query:What is the Total Revenue and Total Revenue From Operations Between the year 2012 to 2017?
+Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20120101,20171231,[Time].[Year], false) from [Cube].[{cube_name}]
+
+user query:-Which months has the value of balance average amount between 40,00,00,000 to 2,00,00,00,000 ?           
+Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] between 400000000.00 and 2000000000.00
+
+user query:-Top 5 Cities on Average Balance Amount.
+Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average",Head([Branch Details].[City],[Business Drivers].[Balance Amount Average],5,undefined) from [Cube].[{cube_name}]
+
+user query:-Please provide Cities and Average Balance Amount where Average Balance Amount is more than 5000 and Count of Customers more than 10.
+Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Count of Customers] > 10.00 and [Business Drivers].[Balance Amount Average] > 5000.00
+
+user query:-what is the count of customers based on rating ?
+Expected Response:-select [External Funding].[Rating] as "Rating", [Business Drivers].[Count of Customers] as "Count of Customers" from [Cube].[{cube_name}]
+
+user query:-Please provide Year and Average Balance Amount and % change from previous year for past 2 years
+Expected Response:-select [Time].[Year] as "Year", [Business Drivers].[Balance Amount Average] as "Balance Amount Average", TrendNumber([Business Drivers].[Balance Amount Average],[Time].[Year],2,'percentage') as "YOY % Change" from [Cube].[{cube_name}]
+
+user query:-What is the closing price of Industry ?
+Expected Response:-select [Industry Details].[Industry Name] as "Industry Name", [Share Price BSE].[Close Price] as "Close Price" from [Cube].[{cube_name}]
+
+user query:-What is the employee count based on Industry Group and Industry?
+Expected Response:-select [Industry Details].[Industry Group Name] as "Industry Group Name", [Industry Details].[Industry Name] as "Industry Name", [EPF Mesures].[Employee Count] as "Employee Count" from [Cube].[{cube_name}]
+
+user query:-What are the closing price of AXIS, HDFC, ICICI & LIC Mutual Funds ?
+Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Share Price BSE].[Close Price] as "Close Price" from [Cube].[{cube_name}] where [Mutual Fund Investment].[Mutual Fund Name] in ('AXIS','HDFC','ICICI','LIC')
+
+user query:-What are the Cash Ratio Current Ratio and Quick Ration Based on Month from 2012 to 2017 ? 
+Expected Response:-select [Time].[Month] as "Month", [Financial Ratios].[Cash Ratio] as "Cash Ratio", [Financial Ratios].[Current Ratio] as "Current Ratio", 
+[Financial Ratios].[Quick Ratio] as "Quick Ratio",TimeBetween(20120101,20171231,[Time].[Month], false) from [Cube].[{cube_name}]
+
+user query:-Provide Current Ratio, Cash Ratio, and Quick ration segregated by industry group?
+Expected Response:-select [Industry Details].[Industry Group Name] as "Industry Group Name", [Financial Ratios].[Current Ratio] as "Current Ratio", [Financial Ratios].[Cash Ratio] as "Cash Ratio", [Financial Ratios].[Quick Ratio] as "Quick Ratio" from [Cube].[{cube_name}]
+
+user query:-Provide the Year and Total Revenue and Value of Previous Year.
+Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", 
+TrendNumber([Financial Data].[Total Revenue],[Time].[Year],1,'value') as "Trend 1" from [Cube].[{cube_name}]
+
+user query:-Provide the Quarter wise %Change from Previous year for Total Revenue.
+Expected Response:-select [Time].[Quarter] as "Quarter", [Financial Data].[Total Revenue] as "Total Revenue", TrendNumber([Financial Data].[Total Revenue],[Time].[Quarter],1,'percentage') as "Trend" from [Cube].[{cube_name}]
+
+user query:-What are the Bottom 4 state based on Total Debit ?
+Expected Response:-select [Branch Details].[State] as "State", [Financial Data].[Total Debit] as "Total Debit",Tail([Branch Details].[State],[Financial Data].[Total Debit],4,undefined) from [Cube].[{cube_name}]
+
+user query:-Which Mutual Funds have the trade price greater than 272 but less than 276 ?
+Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price" from [Cube].[{cube_name}] where [Bulk Deal Trade].[Trade Price] < 276.00 and [Bulk Deal Trade].[Trade Price] > 272.00
+
+user query:-What is the Balance Amount for Mutual funds other than HDFC,SBI,Nippon,HSBC,ICICI,IDFC,AXIS ?
+Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount" from [Cube].[{cube_name}] where [Mutual Fund Investment].[Mutual Fund Name] not in ('SBI','Nippon','HDFC','HSBC','ICICI','IDFC','AXIS')
+
+user query:-What is the total revenue from operation between March 2015 to September 2018 ?
+Expected Response:-select [Time].[Month] as "Month", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20150301,20180930,[Time].[Month], false) from [Cube].[{cube_name}]
+
+user query:-What is the % of Running Sum of Balance amount with respect to Mutual Fund.
+Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount", 
+percentageofrunningsum([Business Drivers].[Balance Amount],'percentagerunningsumacrossrows') as "% of Running sum of Balance Amount" from [Cube].[{cube_name}]
+            
+user query:-Provide the Close price of Index Nifty and Sensex based on Index Name that doesn't contains "Nifty".
+Expected Response:-select [Benchmark Index Details].[Index Name] as "Index Name", [Benchmark Index].[Index Close Price] as "Index Close Price", [Benchmark Index].[NIFTY 500] as "NIFTY 500", [Benchmark Index].[SENSEX 50] as "SENSEX 50" from [Cube].[{cube_name}] where [Benchmark Index Details].[Index Name] not like '%Nifty%'. 
+
+user query:-Provide the list of months not having the balance average amount between 40,00,00,000 to 2,00,00,00,000.               
+Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] not between 400000000.00 and 2000000000.00
+
+user query:-Provide the Month wise Balance Amount with Mutual Fund Name with Balance Amount.
+Expected Response:-select [Time].[Month] as "Month", [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount" from [Cube].[{cube_name}]
+
+user query:-Provide the Close price of Index Nifty and Sensex based on Index Name that contains "Nifty".
+Expected Response:-select [Benchmark Index Details].[Index Name] as "Index Name", [Benchmark Index].[Index Close Price] as "Index Close Price", [Benchmark Index].[NIFTY 500] as "NIFTY 500", [Benchmark Index].[SENSEX 50] as "SENSEX 50" from [Cube].[{cube_name}] where [Benchmark Index Details].[Index Name] like '%Nifty%' 
+
+user query:-What is the Month vise Total Revenue and Total Debit between 1st Jan 2014 to 31st Dec 2019 ?
+Expected Response:-select [Time].[Month] as "Month", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Debit] as "Total Debit",TimeBetween(20140101,20191231,[Time].[Month], false) from [Cube].[{cube_name}]
+
+user query:-Show me the Customer Name and Mutual Fund Name with Balance Amount Greater than 0 and Balance Average Amount with % of Balance Amount.
+Expected Response:-select [Customer Details].[Customer Name] as "Customer Name", [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Business Drivers].[Balance Amount] as "Balance Amount", [Business Drivers].[Balance Amount Average] as "Balance Amount Average", percentage([Business Drivers].[Balance Amount],'percentColumn') as "% of Balance Amount" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount] > 0.00
+
+user query:-Please provide zone and city wise Average Balance Amount.
+Expected Response:-select [Branch Details].[Zone] as "Zone", [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}]
+
+user query:-Provide the Mutual Fund and their Quantity along with Month on Month Quantity and Quarter on Quarter Quantity.
+Expected Response:-select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Fund Investment Details].[Mutual Fund Quantity] as "Mutual Fund Quantity", [Fund Investment Details].[Mutual Fund Quantity MoM] as "Mutual Fund Quantity MoM", [Fund Investment Details].[Mutual Fund Quantity QoQ] as "Mutual Fund Quantity QoQ" from [Cube].[{cube_name}]
+
+</examples>
+Example Approach:
+- If base query has dimensions and measures and new query asks to add or remove some dimension or measure, modify the base query for the corresponding dimension and measure only, rest of the base query needs to be preserved.
+- If base query has the above mentioned filters like where, Head,  preserve them and only ADD new ones if specifically asked
+- If base query has already time ranges and new query is asking new time range forget the previous time range and remove invalidated funtions.
+- If base query has an function and the new query ask for the same function we can have both the function
+- Try to pick queries answer from <example> if mention
+
+Your task is to Modify the base query while keeping its existing structure and elements intact.
+Return only the modified query without any explanations."""
+
+            result = self.llm.invoke(final_prompt)
+            output = result.content
+            pred_query = self.cleanup_gen_query(output)
+            
+            return pred_query
+
+        except Exception as e:
+            logging.error(f"Error generating conversational OLAP query: {e}")
+            raise
+
+    def cleanup_gen_query(self, pred_query):
+        """Clean up the generated query by removing unnecessary formatting."""
+        pred_query = pred_query.replace("```sql","").replace("\n", "").replace("```","")
+        check = pred_query.replace("```","")
+        final_query = check.replace("sql","")
+        return final_query
+
+class OLAPQueryProcessor(LLMConfigure):
+    """Enhanced OLAP processor with conversation memory"""
+    
+    def __init__(self, config_path: str):
+        super().__init__(config_path)
+        
+        try:
+            self.llm_config = LLMConfigure(config_path)
+            self.load_json = self.llm_config.load_config(config_path)
+            self.llm = self.llm_config.initialize_llm()
+            self.embedding = self.llm_config.initialize_embedding()
+            self.dim_measure = DimensionMeasure(self.llm, self.embedding, self.load_json)
+            self.final = FinalQueryGenerator(query="", dimensions=None, measures=None, llm=self.llm)
+
+        except Exception as e:
+            logging.error(f"Error initializing OLAPQueryProcessor: {e}")
+            raise
+
+    def process_query(self, query: str, cube_id: str, prev_conv: dict, cube_name: str, include_conv: str = "no") -> Tuple[str, str, float]:
+        try:
+            cube_dir = os.path.join(vector_db_path, cube_id)
+            if not os.path.exists(cube_dir):
+                return query, "Cube data doesn't exist", 0.0, "", ""
+
+            start_time = time.time()
+            dimensions = self.dim_measure.get_dimensions(query, cube_id, prev_conv)
+            measures = self.dim_measure.get_measures(query, cube_id, prev_conv)
+
+            if not dimensions or not measures:
+                raise ValueError("Failed to extract dimensions or measures")
+
+            # Choose the appropriate query generator based on include_conv
+            if include_conv.lower() == "yes" and prev_conv.get('query'):
+                query_generator = ConversationalQueryGenerator(query, dimensions, measures, self.llm)
+            else:
+                query_generator = FinalQueryGenerator(query, dimensions, measures, self.llm)
+
+            final_query = query_generator.generate_query(query, dimensions, measures, prev_conv, cube_name)
+            
+            processing_time = time.time() - start_time
+            return query, final_query, processing_time, dimensions, measures
+            
+        except Exception as e:
+            logging.error(f"Error in query processing: {e}")
+            raise
+
+def main():
+    """Enhanced main function with better conversation handling"""
+    setup_logging()
+    config_path = "config.json"
+    
+    processor = OLAPQueryProcessor(config_path)
+    
+    print(Fore.CYAN + "\n=== OLAP Query Conversation System ===")
+    print(Fore.CYAN + "Type 'exit' to end the conversation.\n")
+    
+    while True:
+        try:
+            query = input(Fore.GREEN + "Please enter your query: ")
+            
+            if query.lower() == 'exit':
+                print(Fore.YELLOW + "\nThank you for using the OLAP Query System! Goodbye!")
+                break
+            
+            # Process query with enhanced context handling
+            original_query, final_query, processing_time, dimensions, measures = processor.process_query(query)            
+            print(Fore.CYAN + f"\nProcessing time: {processing_time:.2f} seconds\n")
+                               
+        except Exception as e:
+            logging.error(f"Error in conversation: {e}")
+            print(Fore.RED + f"\nI encountered an error: {str(e)}")
+            print(Fore.YELLOW + "Please try rephrasing your question or ask something else.\n")
+            continue
+
+if __name__ == "__main__":
+    main()
