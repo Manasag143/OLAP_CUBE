@@ -62,363 +62,65 @@ def setup_logging():
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-class LLMFunctionSelector:
-    """
-    Uses LLM to intelligently select relevant OLAP functions based on query analysis
-    """
+class SmartFunctionsManager:
+    """Simple function manager - loads YAML and uses LLM to get functions"""
     
     def __init__(self, functions_file: str = "olap_functions.yaml", llm: AzureChatOpenAI = None):
-        self.functions_file = functions_file
         self.llm = llm
-        self.functions_library = self._load_functions_library()
-        self.function_categories = list(self.functions_library.keys())
+        # Load YAML file
+        with open(functions_file, 'r', encoding='utf-8') as f:
+            self.functions_library = yaml.safe_load(f)
         
-    def _load_functions_library(self) -> Dict:
-        """Load functions from YAML file"""
-        try:
-            with open(self.functions_file, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            logging.error(f"Functions file {self.functions_file} not found!")
-            raise FileNotFoundError(f"Required file {self.functions_file} is missing.")
-        except Exception as e:
-            logging.error(f"Error loading functions file: {e}")
-            raise
-    
-    def _create_function_summary(self) -> str:
-        """Create a concise summary of all available function categories"""
-        summary = "Available OLAP Function Categories:\n"
-        
-        for category, functions in self.functions_library.items():
-            category_name = category.replace("_", " ").title()
-            function_names = list(functions.keys())
-            summary += f"- {category_name}: {', '.join(function_names[:3])}{'...' if len(function_names) > 3 else ''}\n"
-            
-            # Add brief description of category purpose
-            if 'time' in category.lower():
-                summary += f"  Purpose: Date/time filtering and analysis\n"
-            elif 'ranking' in category.lower():
-                summary += f"  Purpose: Top/bottom N, sorting operations\n"
-            elif 'conditional' in category.lower():
-                summary += f"  Purpose: WHERE clauses, filtering conditions\n"
-            elif 'aggregation' in category.lower():
-                summary += f"  Purpose: SUM, COUNT, AVERAGE operations\n"
-            elif 'comparison' in category.lower():
-                summary += f"  Purpose: IN, LIKE, NOT operators\n"
-            elif 'mathematical' in category.lower():
-                summary += f"  Purpose: Mathematical calculations and comparisons\n"
-            elif 'utility' in category.lower():
-                summary += f"  Purpose: General utility functions\n"
-        
-        return summary
-    
-    def select_relevant_functions(self, query: str) -> List[str]:
-        """Use LLM to intelligently select relevant function categories"""
-        
-        function_summary = self._create_function_summary()
-        
-        selection_prompt = f"""You are an OLAP query analysis expert. Analyze the user query and determine which function categories are needed to generate the appropriate OLAP cube query.
-
-<instructions>
-- Analyze the user's query intent and requirements
-- Select ONLY the function categories that are actually needed for this specific query
-- Be selective - don't include categories unless they're truly required
-- Consider both explicit requirements and implicit needs
-- Always include 'utility_functions' as they contain basic operations
-</instructions>
-
-{function_summary}
-
-<examples>
-Query: "Show me total revenue between 2012 and 2017"
-Needed Categories: time_functions, utility_functions
-Reasoning: Requires date range filtering (time_functions) and basic operations (utility_functions)
-
-Query: "Top 5 cities by average balance amount"
-Needed Categories: ranking_functions, utility_functions
-Reasoning: Requires ranking/sorting (ranking_functions) and basic operations (utility_functions)
-
-Query: "Show revenue where amount is greater than 1000000 and region is not 'North'"
-Needed Categories: conditional_functions, comparison_functions, mathematical_operations, utility_functions
-Reasoning: Requires WHERE conditions (conditional_functions), NOT operations (comparison_functions), numerical comparisons (mathematical_operations)
-
-Query: "Monthly trend analysis with year-over-year growth percentage"
-Needed Categories: time_functions, aggregation_functions, utility_functions
-Reasoning: Requires time-based analysis (time_functions), percentage calculations (aggregation_functions)
-
-Query: "Count of customers by rating"
-Needed Categories: aggregation_functions, utility_functions
-Reasoning: Requires counting operations (aggregation_functions) and basic operations (utility_functions)
-</examples>
-
-User Query: "{query}"
-
-Respond with ONLY the category names (exactly as shown above) that are needed, separated by commas. Do not include explanations or additional text.
-
-Example response format: time_functions, ranking_functions, utility_functions"""
-
-        try:
-            # Get LLM response
-            response = self.llm.invoke(selection_prompt)
-            selected_categories_text = response.content.strip()
-            
-            # Parse the response
-            selected_categories = [cat.strip() for cat in selected_categories_text.split(',')]
-            
-            # Validate categories exist
-            valid_categories = []
-            for category in selected_categories:
-                if category in self.function_categories:
-                    valid_categories.append(category)
-                else:
-                    logging.warning(f"LLM selected unknown category: {category}")
-            
-            # Ensure utility_functions is always included
-            if 'utility_functions' not in valid_categories:
-                valid_categories.append('utility_functions')
-            
-            # Fallback: if no valid categories or too few, include all
-            if len(valid_categories) < 2:
-                logging.warning("LLM selection seems incomplete, using all categories as fallback")
-                valid_categories = self.function_categories
-            
-            logging.info(f"LLM selected function categories: {valid_categories}")
-            return valid_categories
-            
-        except Exception as e:
-            logging.error(f"Error in LLM function selection: {e}")
-            # Fallback to all categories
-            logging.info("Falling back to all function categories due to error")
-            return self.function_categories
-    
-    def build_dynamic_functions_section(self, query: str) -> str:
-        """Build functions section with LLM-selected relevant functions"""
-        selected_categories = self.select_relevant_functions(query)
-        functions_text = "<functions>\n"
-        
-        total_functions_selected = 0
-        for category in selected_categories:
-            if category in self.functions_library:
-                category_funcs = self.functions_library[category]
-                total_functions_selected += len(category_funcs)
-                
-                # Add category header
-                category_name = category.replace("_", " ").title()
-                functions_text += f"\n## {category_name}:\n"
-                
-                # Add each function in this category
-                for func_name, func_info in category_funcs.items():
-                    functions_text += f"- {func_name}: {func_info['syntax']}\n"
-                    functions_text += f"  Example: {func_info['example']}\n"
-                    if 'use_case' in func_info:
-                        functions_text += f"  Use: {func_info['use_case']}\n"
-        
-        functions_text += "</functions>"
-        
-        # Log optimization metrics
-        total_functions = sum(len(funcs) for funcs in self.functions_library.values())
-        optimization_percentage = (total_functions_selected/total_functions)*100
-        
-        logging.info(f"LLM Function optimization: Using {total_functions_selected}/{total_functions} functions ({optimization_percentage:.1f}%)")
-        logging.info(f"Selected categories: {', '.join(selected_categories)}")
-        
-        return functions_text
-
-class PromptFunctionSelector:
-    """
-    Uses prompt-based approach to select specific functions rather than categories
-    """
-    
-    def __init__(self, functions_library: Dict, llm: AzureChatOpenAI):
-        self.functions_library = functions_library
-        self.llm = llm
-        self.all_functions = self._flatten_functions()
-    
-    def _flatten_functions(self) -> Dict:
-        """Flatten functions from categories into a single dictionary"""
-        flattened = {}
+        # Make flat list of all functions
+        self.all_functions = {}
         for category, functions in self.functions_library.items():
             for func_name, func_info in functions.items():
-                flattened[func_name] = {
-                    'category': category,
-                    'syntax': func_info['syntax'],
-                    'example': func_info['example'],
-                    'use_case': func_info.get('use_case', '')
-                }
-        return flattened
-    
-    def _create_functions_summary(self) -> str:
-        """Create a comprehensive summary of all available functions"""
-        summary = "Available OLAP Functions:\n\n"
-        
-        for func_name, func_info in self.all_functions.items():
-            summary += f"- {func_name}:\n"
-            summary += f"  Syntax: {func_info['syntax']}\n"
-            summary += f"  Use Case: {func_info['use_case']}\n"
-            summary += f"  Example: {func_info['example']}\n\n"
-        
-        return summary
-    
-    def select_specific_functions(self, query: str) -> List[str]:
-        """Use LLM to select specific functions needed for the query"""
-        
-        functions_summary = self._create_functions_summary()
-        
-        selection_prompt = f"""You are an OLAP query expert. Analyze the user query and select ONLY the specific OLAP functions that are needed to generate the appropriate cube query.
-
-<instructions>
-- Analyze the user's query requirements carefully
-- Select ONLY the specific function names that are actually needed
-- Be very selective - only include functions that are directly required
-- Consider time operations, ranking, filtering, calculations, etc.
-- Do NOT select functions that are not explicitly needed
-- If no special functions are needed, return "NONE"
-</instructions>
-
-{functions_summary}
-
-<examples>
-Query: "Show me total revenue between 2012 and 2017"
-Selected Functions: TimeBetween
-Reasoning: Needs date range filtering
-
-Query: "Top 5 cities by average balance amount"
-Selected Functions: Head
-Reasoning: Needs ranking/top N functionality
-
-Query: "Show revenue where amount is greater than 1000000 and region is not 'North'"
-Selected Functions: NONE
-Reasoning: Uses standard WHERE clause operators, no special functions needed
-
-Query: "Monthly trend analysis with year-over-year growth percentage"
-Selected Functions: TrendNumber
-Reasoning: Needs trend/percentage calculation
-
-Query: "What is the % of running sum of balance amount"
-Selected Functions: percentageofrunningsum
-Reasoning: Needs running sum percentage calculation
-
-Query: "Bottom 4 states based on total debit"
-Selected Functions: Tail
-Reasoning: Needs bottom N ranking
-
-Query: "Show data between March 2015 to September 2018"
-Selected Functions: TimeBetween
-Reasoning: Needs date range filtering
-
-Query: "Show customer count by rating" 
-Selected Functions: NONE
-Reasoning: Simple groupby operation, no special functions needed
-</examples>
-
-User Query: "{query}"
-
-Respond with ONLY the function names that are needed, separated by commas. If no special functions are needed, respond with "NONE".
-
-Example response format: TimeBetween, Head
-OR: NONE"""
-
-        try:
-            # Get LLM response
-            response = self.llm.invoke(selection_prompt)
-            selected_functions_text = response.content.strip()
-            
-            # Parse the response
-            if selected_functions_text.upper() == "NONE":
-                return []
-            
-            selected_functions = [func.strip() for func in selected_functions_text.split(',')]
-            
-            # Validate functions exist
-            valid_functions = []
-            for function in selected_functions:
-                if function in self.all_functions:
-                    valid_functions.append(function)
-                else:
-                    logging.warning(f"LLM selected unknown function: {function}")
-            
-            logging.info(f"LLM selected specific functions: {valid_functions}")
-            return valid_functions
-            
-        except Exception as e:
-            logging.error(f"Error in LLM function selection: {e}")
-            return []
+                self.all_functions[func_name] = func_info
     
     def build_dynamic_functions_section(self, query: str) -> str:
-        """Build functions section with only the specific selected functions"""
-        selected_functions = self.select_specific_functions(query)
+        """Get functions from LLM prompt"""
         
-        if not selected_functions:
-            return "<functions>\nNo special OLAP functions needed for this query.\n</functions>"
+        # Create function list for LLM
+        functions_text = "Available Functions:\n"
+        for func_name, func_info in self.all_functions.items():
+            functions_text += f"- {func_name}: {func_info['syntax']}\n"
+            functions_text += f"  Use: {func_info.get('use_case', '')}\n"
+            functions_text += f"  Example: {func_info['example']}\n\n"
         
-        functions_text = "<functions>\n"
+        # Ask LLM which functions needed
+        prompt = f"""Look at this query and tell me which OLAP functions are needed.
+
+{functions_text}
+
+Query: "{query}"
+
+Examples:
+- "Top 5 cities" needs: Head
+- "Between 2020-2023" needs: TimeBetween  
+- "Bottom 3 states" needs: Tail
+- "Count by region" needs: NONE
+
+Just give me function names separated by commas, or "NONE" if no special functions needed.
+Response format: Head, TimeBetween OR NONE"""
+
+        # Get LLM response
+        response = self.llm.invoke(prompt)
+        selected_text = response.content.strip()
         
-        for func_name in selected_functions:
+        # Build result
+        if selected_text.upper() == "NONE":
+            return "<functions>\nNo special functions needed.\n</functions>"
+        
+        result = "<functions>\n"
+        for func_name in selected_text.split(','):
+            func_name = func_name.strip()
             if func_name in self.all_functions:
                 func_info = self.all_functions[func_name]
-                functions_text += f"\n- {func_name}: {func_info['syntax']}\n"
-                functions_text += f"  Example: {func_info['example']}\n"
-                if func_info['use_case']:
-                    functions_text += f"  Use: {func_info['use_case']}\n"
+                result += f"- {func_name}: {func_info['syntax']}\n"
+                result += f"  Example: {func_info['example']}\n"
+        result += "</functions>"
         
-        functions_text += "</functions>"
-        
-        # Log optimization metrics
-        total_functions = len(self.all_functions)
-        selected_count = len(selected_functions)
-        optimization_percentage = (selected_count/total_functions)*100 if total_functions > 0 else 0
-        
-        logging.info(f"Prompt-based optimization: Using {selected_count}/{total_functions} functions ({optimization_percentage:.1f}%)")
-        logging.info(f"Selected functions: {', '.join(selected_functions)}")
-        
-        return functions_text
-
-class SmartFunctionsManager:
-    """
-    Enhanced Functions Manager with Prompt-based and LLM Category-based selection
-    """
-    
-    def __init__(self, functions_file: str = "olap_functions.yaml", llm: AzureChatOpenAI = None, selection_method: str = "prompt"):
-        self.functions_file = functions_file
-        self.llm = llm
-        self.selection_method = selection_method  # "prompt" or "llm_category"
-        self.functions_library = self._load_functions_library()
-        
-        # Initialize appropriate selector
-        if self.llm:
-            try:
-                if self.selection_method == "prompt":
-                    self.selector = PromptFunctionSelector(self.functions_library, llm)
-                    logging.info("Initialized Prompt-based specific function selector")
-                else:  # llm_category
-                    self.selector = LLMFunctionSelector(functions_file, llm)
-                    logging.info("Initialized LLM-based category function selector")
-            except Exception as e:
-                logging.error(f"Failed to initialize function selector: {e}")
-                raise
-        else:
-            logging.error("No LLM provided for function selection")
-            raise ValueError("LLM is required for function selection")
-    
-    def _load_functions_library(self) -> Dict:
-        """Load functions from YAML file"""
-        try:
-            with open(self.functions_file, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f)
-        except FileNotFoundError:
-            logging.error(f"Functions file {self.functions_file} not found! Please create the YAML file.")
-            raise FileNotFoundError(f"Required file {self.functions_file} is missing. Please create it.")
-        except Exception as e:
-            logging.error(f"Error loading functions file: {e}")
-            raise
-    
-    def build_dynamic_functions_section(self, query: str) -> str:
-        """Build functions section with intelligent selection"""
-        try:
-            return self.selector.build_dynamic_functions_section(query)
-        except Exception as e:
-            logging.error(f"Error in function selection: {e}")
-            return "<functions>\nError in function selection. No functions available.\n</functions>"
+        return result
 
 class LLMConfigure:
     """Class responsible for loading and configuring LLM and embedding models from a config file."""
@@ -632,18 +334,13 @@ class DimensionMeasure:
 class FinalQueryGenerator(LLMConfigure):
     """Class responsible for generating the final OLAP query based on dimensions and measures."""
     
-    def __init__(self, query, dimensions: None, measures: None, llm: None, function_selection_method: str = "prompt"):
+    def __init__(self, query, dimensions: None, measures: None, llm: None):
         super().__init__()
         self.query = query
         self.dimensions = dimensions
         self.measures = measures
         self.llm = llm
-        # Initialize with Prompt-based function selection (default) or LLM category-based
-        self.functions_manager = SmartFunctionsManager(
-            functions_file="olap_functions.yaml",
-            llm=llm,
-            selection_method=function_selection_method  # "prompt" or "llm_category"
-        )
+        self.functions_manager = SmartFunctionsManager("olap_functions.yaml", llm)
         
     def call_gpt(self, final_prompt: str):
         """Function responsible for generating final query"""
@@ -694,12 +391,8 @@ class FinalQueryGenerator(LLMConfigure):
 
     def generate_query(self, query: str, dimensions: str, measures: str, prev_conv: dict, cube_name: str) -> str:
         try:
-            if not dimensions or not measures:
-                raise ValueError("Both dimensions and measures are required to generate a query.")
-            
-            # Use Prompt-based function selection (more precise)
+            # Get functions from LLM
             dynamic_functions = self.functions_manager.build_dynamic_functions_section(query)
-            logging.info(f"QUERY_GENERATION_FUNCTIONS - Dynamic functions loaded using prompt-based selection")
                 
             final_prompt = f"""You are an expert in generating SQL Cube query. You will be provided dimensions delimited by $$$$ and measures delimited by &&&&.
             Your Goal is to generate a precise single line cube query for the user query delimited by ####.
@@ -721,26 +414,3 @@ class FinalQueryGenerator(LLMConfigure):
             - All numeric values should not have leading zeros
             
             {dynamic_functions}
-
-            <examples>
-
-            user query:What is the Total Revenue and Total Revenue From Operations Between the year 2012 to 2017?
-            Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20120101,20171231,[Time].[Year], false) from [Cube].[{cube_name}]
-	    
-	    user query:Mutual Fund Name wise Trade Price & Quantity ?
-  	    Expected Response:select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price", [Bulk Deal Trade].[Traded Quantity] as "Traded Quantity" from [Cube].[{cube_name}]
-
-            user query:-Which months has the value of balance average amount between 40,00,00,000 to 2,00,00,00,000 ?           
-            Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] between 400000000.00 and 2000000000.00
-
-            user query:-Top 5 Cities on Average Balance Amount.
-            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average",Head([Branch Details].[City],[Business Drivers].[Balance Amount Average],5,undefined) from [Cube].[{cube_name}]
-
-            user query:-Please provide Cities and Average Balance Amount where Average Balance Amount is more than 5000 and Count of Customers more than 10.
-            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Count of Customers] > 10.00 and [Business Drivers].[Balance Amount Average] > 5000.00
-
-            user query:-what is the count of customers based on rating ?
-            Expected Response:-select [External Funding].[Rating] as "Rating", [Business Drivers].[Count of Customers] as "Count of Customers" from [Cube].[{cube_name}]
-
-            user query:-Please provide Year and Average Balance Amount and % change from previous year for past 2 years
-            Expected Response:-select [Time].[Year
