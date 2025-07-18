@@ -1,0 +1,746 @@
+import logging
+import time
+import json
+import os
+import requests
+import yaml
+from datetime import date
+from colorama import Fore, Style, init
+from typing import Dict, List, Tuple, Optional
+
+from langchain_core.documents import Document
+from langchain_community.vectorstores.chroma import Chroma
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_openai import AzureChatOpenAI
+from langchain_community.callbacks import get_openai_callback
+from langchain.prompts import PromptTemplate
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CUBE_DETAILS_DIR = os.path.join(BASE_DIR, "cube_details")
+IMPORT_HISTORY_FILE = os.path.join(BASE_DIR, "import_history.json")
+history_file = os.path.join(BASE_DIR, "conversation_history.json")
+vector_db_path = os.path.join(BASE_DIR, "vector_db")
+config_file = os.path.join(BASE_DIR, "config.json")
+
+def load_documents_from_json(cube_id: str, doc_type: str, base_dir: str) -> List[Document]:
+    """Load documents from JSON file"""
+    try:
+        file_path = os.path.join(base_dir, cube_id, f"{cube_id}_{doc_type}.json")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Cube data doesn't exist")
+            
+        with open(file_path) as f:
+            data = json.load(f)
+            
+        # Convert to Document objects
+        documents = []
+        for doc in data:
+            content = f"Group Name:{doc['Group Name']}--Level Name:{doc['Level Name']}--Description:{doc['Description']}"
+            documents.append(Document(page_content=content))
+        return documents
+            
+    except Exception as e:
+        logging.error(f"Error loading {doc_type} documents: {str(e)}")
+        raise
+
+def setup_logging():
+    """Store errors in log folder datewise and token consumptions."""
+    today = date.today()
+    log_folder = './log'
+  
+    if not os.path.exists(log_folder):
+        os.mkdir(log_folder)
+    
+    logging.basicConfig(
+        filename=f"{log_folder}/{today}.log",
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+class LLMFunctionSelector:
+    """
+    Uses LLM to intelligently select relevant OLAP functions based on query analysis
+    """
+    
+    def __init__(self, functions_file: str = "olap_functions.yaml", llm: AzureChatOpenAI = None):
+        self.functions_file = functions_file
+        self.llm = llm
+        self.functions_library = self._load_functions_library()
+        self.function_categories = list(self.functions_library.keys())
+        
+    def _load_functions_library(self) -> Dict:
+        """Load functions from YAML file"""
+        try:
+            with open(self.functions_file, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"Functions file {self.functions_file} not found!")
+            raise FileNotFoundError(f"Required file {self.functions_file} is missing.")
+        except Exception as e:
+            logging.error(f"Error loading functions file: {e}")
+            raise
+    
+    def _create_function_summary(self) -> str:
+        """Create a concise summary of all available function categories"""
+        summary = "Available OLAP Function Categories:\n"
+        
+        for category, functions in self.functions_library.items():
+            category_name = category.replace("_", " ").title()
+            function_names = list(functions.keys())
+            summary += f"- {category_name}: {', '.join(function_names[:3])}{'...' if len(function_names) > 3 else ''}\n"
+            
+            # Add brief description of category purpose
+            if 'time' in category.lower():
+                summary += f"  Purpose: Date/time filtering and analysis\n"
+            elif 'ranking' in category.lower():
+                summary += f"  Purpose: Top/bottom N, sorting operations\n"
+            elif 'conditional' in category.lower():
+                summary += f"  Purpose: WHERE clauses, filtering conditions\n"
+            elif 'aggregation' in category.lower():
+                summary += f"  Purpose: SUM, COUNT, AVERAGE operations\n"
+            elif 'comparison' in category.lower():
+                summary += f"  Purpose: IN, LIKE, NOT operators\n"
+            elif 'mathematical' in category.lower():
+                summary += f"  Purpose: Mathematical calculations and comparisons\n"
+            elif 'utility' in category.lower():
+                summary += f"  Purpose: General utility functions\n"
+        
+        return summary
+    
+    def select_relevant_functions(self, query: str) -> List[str]:
+        """Use LLM to intelligently select relevant function categories"""
+        
+        function_summary = self._create_function_summary()
+        
+        selection_prompt = f"""You are an OLAP query analysis expert. Analyze the user query and determine which function categories are needed to generate the appropriate OLAP cube query.
+
+<instructions>
+- Analyze the user's query intent and requirements
+- Select ONLY the function categories that are actually needed for this specific query
+- Be selective - don't include categories unless they're truly required
+- Consider both explicit requirements and implicit needs
+- Always include 'utility_functions' as they contain basic operations
+</instructions>
+
+{function_summary}
+
+<examples>
+Query: "Show me total revenue between 2012 and 2017"
+Needed Categories: time_functions, utility_functions
+Reasoning: Requires date range filtering (time_functions) and basic operations (utility_functions)
+
+Query: "Top 5 cities by average balance amount"
+Needed Categories: ranking_functions, utility_functions
+Reasoning: Requires ranking/sorting (ranking_functions) and basic operations (utility_functions)
+
+Query: "Show revenue where amount is greater than 1000000 and region is not 'North'"
+Needed Categories: conditional_functions, comparison_functions, mathematical_operations, utility_functions
+Reasoning: Requires WHERE conditions (conditional_functions), NOT operations (comparison_functions), numerical comparisons (mathematical_operations)
+
+Query: "Monthly trend analysis with year-over-year growth percentage"
+Needed Categories: time_functions, aggregation_functions, utility_functions
+Reasoning: Requires time-based analysis (time_functions), percentage calculations (aggregation_functions)
+
+Query: "Count of customers by rating"
+Needed Categories: aggregation_functions, utility_functions
+Reasoning: Requires counting operations (aggregation_functions) and basic operations (utility_functions)
+</examples>
+
+User Query: "{query}"
+
+Respond with ONLY the category names (exactly as shown above) that are needed, separated by commas. Do not include explanations or additional text.
+
+Example response format: time_functions, ranking_functions, utility_functions"""
+
+        try:
+            # Get LLM response
+            response = self.llm.invoke(selection_prompt)
+            selected_categories_text = response.content.strip()
+            
+            # Parse the response
+            selected_categories = [cat.strip() for cat in selected_categories_text.split(',')]
+            
+            # Validate categories exist
+            valid_categories = []
+            for category in selected_categories:
+                if category in self.function_categories:
+                    valid_categories.append(category)
+                else:
+                    logging.warning(f"LLM selected unknown category: {category}")
+            
+            # Ensure utility_functions is always included
+            if 'utility_functions' not in valid_categories:
+                valid_categories.append('utility_functions')
+            
+            # Fallback: if no valid categories or too few, include all
+            if len(valid_categories) < 2:
+                logging.warning("LLM selection seems incomplete, using all categories as fallback")
+                valid_categories = self.function_categories
+            
+            logging.info(f"LLM selected function categories: {valid_categories}")
+            return valid_categories
+            
+        except Exception as e:
+            logging.error(f"Error in LLM function selection: {e}")
+            # Fallback to all categories
+            logging.info("Falling back to all function categories due to error")
+            return self.function_categories
+    
+    def build_dynamic_functions_section(self, query: str) -> str:
+        """Build functions section with LLM-selected relevant functions"""
+        selected_categories = self.select_relevant_functions(query)
+        functions_text = "<functions>\n"
+        
+        total_functions_selected = 0
+        for category in selected_categories:
+            if category in self.functions_library:
+                category_funcs = self.functions_library[category]
+                total_functions_selected += len(category_funcs)
+                
+                # Add category header
+                category_name = category.replace("_", " ").title()
+                functions_text += f"\n## {category_name}:\n"
+                
+                # Add each function in this category
+                for func_name, func_info in category_funcs.items():
+                    functions_text += f"- {func_name}: {func_info['syntax']}\n"
+                    functions_text += f"  Example: {func_info['example']}\n"
+                    if 'use_case' in func_info:
+                        functions_text += f"  Use: {func_info['use_case']}\n"
+        
+        functions_text += "</functions>"
+        
+        # Log optimization metrics
+        total_functions = sum(len(funcs) for funcs in self.functions_library.values())
+        optimization_percentage = (total_functions_selected/total_functions)*100
+        
+        logging.info(f"LLM Function optimization: Using {total_functions_selected}/{total_functions} functions ({optimization_percentage:.1f}%)")
+        logging.info(f"Selected categories: {', '.join(selected_categories)}")
+        
+        return functions_text
+
+class PromptFunctionSelector:
+    """
+    Uses prompt-based approach to select specific functions rather than categories
+    """
+    
+    def __init__(self, functions_library: Dict, llm: AzureChatOpenAI):
+        self.functions_library = functions_library
+        self.llm = llm
+        self.all_functions = self._flatten_functions()
+    
+    def _flatten_functions(self) -> Dict:
+        """Flatten functions from categories into a single dictionary"""
+        flattened = {}
+        for category, functions in self.functions_library.items():
+            for func_name, func_info in functions.items():
+                flattened[func_name] = {
+                    'category': category,
+                    'syntax': func_info['syntax'],
+                    'example': func_info['example'],
+                    'use_case': func_info.get('use_case', '')
+                }
+        return flattened
+    
+    def _create_functions_summary(self) -> str:
+        """Create a comprehensive summary of all available functions"""
+        summary = "Available OLAP Functions:\n\n"
+        
+        for func_name, func_info in self.all_functions.items():
+            summary += f"- {func_name}:\n"
+            summary += f"  Syntax: {func_info['syntax']}\n"
+            summary += f"  Use Case: {func_info['use_case']}\n"
+            summary += f"  Example: {func_info['example']}\n\n"
+        
+        return summary
+    
+    def select_specific_functions(self, query: str) -> List[str]:
+        """Use LLM to select specific functions needed for the query"""
+        
+        functions_summary = self._create_functions_summary()
+        
+        selection_prompt = f"""You are an OLAP query expert. Analyze the user query and select ONLY the specific OLAP functions that are needed to generate the appropriate cube query.
+
+<instructions>
+- Analyze the user's query requirements carefully
+- Select ONLY the specific function names that are actually needed
+- Be very selective - only include functions that are directly required
+- Consider time operations, ranking, filtering, calculations, etc.
+- Do NOT select functions that are not explicitly needed
+- If no special functions are needed, return "NONE"
+</instructions>
+
+{functions_summary}
+
+<examples>
+Query: "Show me total revenue between 2012 and 2017"
+Selected Functions: TimeBetween
+Reasoning: Needs date range filtering
+
+Query: "Top 5 cities by average balance amount"
+Selected Functions: Head
+Reasoning: Needs ranking/top N functionality
+
+Query: "Show revenue where amount is greater than 1000000 and region is not 'North'"
+Selected Functions: NONE
+Reasoning: Uses standard WHERE clause operators, no special functions needed
+
+Query: "Monthly trend analysis with year-over-year growth percentage"
+Selected Functions: TrendNumber
+Reasoning: Needs trend/percentage calculation
+
+Query: "What is the % of running sum of balance amount"
+Selected Functions: percentageofrunningsum
+Reasoning: Needs running sum percentage calculation
+
+Query: "Bottom 4 states based on total debit"
+Selected Functions: Tail
+Reasoning: Needs bottom N ranking
+
+Query: "Show data between March 2015 to September 2018"
+Selected Functions: TimeBetween
+Reasoning: Needs date range filtering
+
+Query: "Show customer count by rating" 
+Selected Functions: NONE
+Reasoning: Simple groupby operation, no special functions needed
+</examples>
+
+User Query: "{query}"
+
+Respond with ONLY the function names that are needed, separated by commas. If no special functions are needed, respond with "NONE".
+
+Example response format: TimeBetween, Head
+OR: NONE"""
+
+        try:
+            # Get LLM response
+            response = self.llm.invoke(selection_prompt)
+            selected_functions_text = response.content.strip()
+            
+            # Parse the response
+            if selected_functions_text.upper() == "NONE":
+                return []
+            
+            selected_functions = [func.strip() for func in selected_functions_text.split(',')]
+            
+            # Validate functions exist
+            valid_functions = []
+            for function in selected_functions:
+                if function in self.all_functions:
+                    valid_functions.append(function)
+                else:
+                    logging.warning(f"LLM selected unknown function: {function}")
+            
+            logging.info(f"LLM selected specific functions: {valid_functions}")
+            return valid_functions
+            
+        except Exception as e:
+            logging.error(f"Error in LLM function selection: {e}")
+            return []
+    
+    def build_dynamic_functions_section(self, query: str) -> str:
+        """Build functions section with only the specific selected functions"""
+        selected_functions = self.select_specific_functions(query)
+        
+        if not selected_functions:
+            return "<functions>\nNo special OLAP functions needed for this query.\n</functions>"
+        
+        functions_text = "<functions>\n"
+        
+        for func_name in selected_functions:
+            if func_name in self.all_functions:
+                func_info = self.all_functions[func_name]
+                functions_text += f"\n- {func_name}: {func_info['syntax']}\n"
+                functions_text += f"  Example: {func_info['example']}\n"
+                if func_info['use_case']:
+                    functions_text += f"  Use: {func_info['use_case']}\n"
+        
+        functions_text += "</functions>"
+        
+        # Log optimization metrics
+        total_functions = len(self.all_functions)
+        selected_count = len(selected_functions)
+        optimization_percentage = (selected_count/total_functions)*100 if total_functions > 0 else 0
+        
+        logging.info(f"Prompt-based optimization: Using {selected_count}/{total_functions} functions ({optimization_percentage:.1f}%)")
+        logging.info(f"Selected functions: {', '.join(selected_functions)}")
+        
+        return functions_text
+
+class SmartFunctionsManager:
+    """
+    Enhanced Functions Manager with Prompt-based and LLM Category-based selection
+    """
+    
+    def __init__(self, functions_file: str = "olap_functions.yaml", llm: AzureChatOpenAI = None, selection_method: str = "prompt"):
+        self.functions_file = functions_file
+        self.llm = llm
+        self.selection_method = selection_method  # "prompt" or "llm_category"
+        self.functions_library = self._load_functions_library()
+        
+        # Initialize appropriate selector
+        if self.llm:
+            try:
+                if self.selection_method == "prompt":
+                    self.selector = PromptFunctionSelector(self.functions_library, llm)
+                    logging.info("Initialized Prompt-based specific function selector")
+                else:  # llm_category
+                    self.selector = LLMFunctionSelector(functions_file, llm)
+                    logging.info("Initialized LLM-based category function selector")
+            except Exception as e:
+                logging.error(f"Failed to initialize function selector: {e}")
+                raise
+        else:
+            logging.error("No LLM provided for function selection")
+            raise ValueError("LLM is required for function selection")
+    
+    def _load_functions_library(self) -> Dict:
+        """Load functions from YAML file"""
+        try:
+            with open(self.functions_file, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"Functions file {self.functions_file} not found! Please create the YAML file.")
+            raise FileNotFoundError(f"Required file {self.functions_file} is missing. Please create it.")
+        except Exception as e:
+            logging.error(f"Error loading functions file: {e}")
+            raise
+    
+    def build_dynamic_functions_section(self, query: str) -> str:
+        """Build functions section with intelligent selection"""
+        try:
+            return self.selector.build_dynamic_functions_section(query)
+        except Exception as e:
+            logging.error(f"Error in function selection: {e}")
+            return "<functions>\nError in function selection. No functions available.\n</functions>"
+
+class LLMConfigure:
+    """Class responsible for loading and configuring LLM and embedding models from a config file."""
+
+    def __init__(self, config_path: str = "config.json"):
+        self.config = self.load_config(config_path)
+        self.llm = None
+        self.embedding = None
+
+    def load_config(self, config_path: str) -> Dict:
+        """Loads the config from a JSON file."""
+        try:
+            with open(config_path, 'r') as config_file:
+                config = json.load(config_file)
+                return config
+        except FileNotFoundError as e:
+            logging.error(f"Config file not found: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logging.error(f"Error parsing the config file: {e}")
+            raise
+
+    def initialize_llm(self):
+        """Initializes and returns the LLM model."""
+        try:
+            self.llm = AzureChatOpenAI(
+                openai_api_key=self.config['llm']['OPENAI_API_KEY'],
+                model=self.config['llm']['model'],
+                temperature=self.config['llm']['temperature'],
+                api_version=self.config['llm']["OPENAI_API_VERSION"],
+                azure_endpoint=self.config['llm']["AZURE_OPENAI_ENDPOINT"],
+                seed=self.config['llm']["seed"]
+            )
+            return self.llm
+        except KeyError as e:
+            logging.error(f"Missing LLM configuration in config file: {e}")
+            raise
+
+    def initialize_embedding(self):
+        """Initializes and returns the Embedding model."""
+        try:
+            self.embedding = AzureOpenAIEmbeddings(
+                deployment=self.config['embedding']['deployment'],
+                azure_endpoint=self.config['llm']["AZURE_OPENAI_ENDPOINT"],
+                openai_api_key=self.config['llm']['OPENAI_API_KEY'],
+                show_progress_bar=self.config['embedding']['show_progress_bar'],
+                disallowed_special=(),
+                openai_api_type=self.config['llm']['OPENAI_API_TYPE']
+            )
+            return self.embedding
+        except KeyError as e:
+            logging.error(f"Missing embedding configuration in config file: {e}")
+            raise
+
+class DimensionMeasure:
+    """Class responsible for extracting dimensions and measures from the natural language query."""
+
+    def __init__(self, llm: str, embedding: str, vectorstore: str):
+        self.llm = llm
+        self.embedding = embedding
+        self.vector_embedding = vectorstore
+
+    def get_dimensions(self, query: str, cube_id: str, prev_conv: dict) -> str:
+        """Extracts dimensions from the query."""
+        try:
+            with get_openai_callback() as dim_cb:
+                query_dim = """ 
+                As an SQL CUBE query expert, analyze the user's question and identify all relevant cube dimensions from the dimensions delimited by ####.
+                
+                <instructions>
+                - Select relevant dimension group, level, description according to user query from dimensions list delimited by ####
+                - format of one dimension: Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description> 
+                - Include all dimensions relevant to the question in the response
+                - Group Name and Level Name can never be same, extract corresponding group name for a selected level name according to the user query and vice versa.
+                - If relevant dimensions group and level are not present in the dimensions list, please return "Not Found"
+                - If the query mentions date, year, month ranges, include corresponding dimensions in the response  
+                </instructions>
+                
+                Response format:
+                Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description>
+
+                Review:
+                - ensure dimensions are only selected from dimensions list delimited by ####
+                - Group Name and Level Name can never be same, extract corresponding group name, description for a selected level name according to the user query and vice versa.
+                - Kindly ensure that the retrieved dimensions group name and level name is present otherwise return "Not found".
+
+                User Query: {question}
+                ####
+                {context}
+                ####
+                """
+
+                print(Fore.RED + '    Identifying Dimensions group name and level name......................\n')
+                
+                # Load documents from JSON
+                documents = load_documents_from_json(cube_id, "dimensions", vector_db_path)
+                
+                # Initialize BM25 retriever
+                bm25_retriever = BM25Retriever.from_documents(documents, k=10)
+                    
+                # Set up vector store directory
+                cube_dir = os.path.join(vector_db_path, cube_id)
+                cube_dim = os.path.join(cube_dir, "dimensions")
+                
+                load_embedding_dim = Chroma(persist_directory=cube_dim, embedding_function=self.embedding)
+                vector_retriever = load_embedding_dim.as_retriever(search_type="similarity", search_kwargs={"k": 20})
+
+                # Create ensemble retriever
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.5, 0.5]
+                )
+                
+                # Initialize and run QA chain
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    retriever=ensemble_retriever,
+                    return_source_documents=True,
+                    verbose=True,
+                    chain_type_kwargs={
+                        "prompt": PromptTemplate(
+                            template=query_dim,
+                            input_variables=["query", "context"]
+                        ),
+                        "verbose": True
+                    }
+                )
+
+                # Get results
+                result = qa_chain({"query": query, "context": ensemble_retriever})
+                dim = result['result']
+                print(Fore.GREEN + '    Identified Group and level name :        ' + str(dim))
+                logging.info(f"Extracted dimensions :\n {dim}")
+                return dim
+
+        except Exception as e:
+            logging.error(f"Error extracting dimensions : {e}")
+            raise
+
+    def get_measures(self, query: str, cube_id: str, prev_conv: dict) -> str:
+        """Extracts measures from the query."""
+        try:
+            with get_openai_callback() as msr_cb:
+                query_msr = """ 
+                As an SQL CUBE query expert, analyze the user's question and identify all relevant cube measures from the measures delimited by ####.
+                
+                <instructions>
+                - Select relevant measure group, level, description according to user query from measures list delimited by ####
+                - format of one measure: Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description> 
+                - Include all measures relevant to the question in the response
+                - Group Name and Level Name can never be same, extract corresponding group name for a selected level name according to the user query and vice versa.
+                - If relevant measures are not present in the measures list, please return "Not Found" 
+                </instructions>
+
+                Response format:
+                Group Name:<Group Name>--Level Name:<Level Name>--Description:<Description>
+
+                Review:
+                - Ensure measures are only selected from measures list delimited by ####
+                - Group Name and Level Name can never be same, extract corresponding group name, description for a selected level name according to the user query and vice versa.
+                - Kindly ensure that the retrieved measures group name and level name is present otherwise return "Not found".
+
+                User Query: {question}
+                ####
+                {context}
+                ####
+                """
+
+                print(Fore.RED + '    Identifying Measure group name and level name......................\n')
+                
+                # Load documents from JSON
+                documents = load_documents_from_json(cube_id, "measures", vector_db_path)
+                
+                bm25_retriever = BM25Retriever.from_documents(documents, k=10)
+
+                cube_msr = os.path.join(vector_db_path, cube_id, "measures")
+                load_embedding_msr = Chroma(persist_directory=cube_msr, embedding_function=self.embedding)
+                vector_retriever = load_embedding_msr.as_retriever(search_type="similarity", search_kwargs={"k": 20})
+                
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.5, 0.5]
+                )
+
+                # Run QA chain with ensemble retriever
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    retriever=ensemble_retriever,
+                    return_source_documents=True,
+                    verbose=True,
+                    chain_type_kwargs={
+                        "prompt": PromptTemplate(
+                            template=query_msr,
+                            input_variables=["query", "context"]
+                        ),
+                        "verbose": True
+                    }
+                )
+                
+                result = qa_chain({"query": query, "context": ensemble_retriever})
+                msr = result['result']
+
+                print(Fore.GREEN + '    Measures result :        ' + str(result)) 
+                logging.info(f"Extracted measures :\n {msr}")  
+                return msr
+        
+        except Exception as e:
+            logging.error(f"Error Extracting Measure: {e}")
+            raise
+
+class FinalQueryGenerator(LLMConfigure):
+    """Class responsible for generating the final OLAP query based on dimensions and measures."""
+    
+    def __init__(self, query, dimensions: None, measures: None, llm: None, function_selection_method: str = "prompt"):
+        super().__init__()
+        self.query = query
+        self.dimensions = dimensions
+        self.measures = measures
+        self.llm = llm
+        # Initialize with Prompt-based function selection (default) or LLM category-based
+        self.functions_manager = SmartFunctionsManager(
+            functions_file="olap_functions.yaml",
+            llm=llm,
+            selection_method=function_selection_method  # "prompt" or "llm_category"
+        )
+        
+    def call_gpt(self, final_prompt: str):
+        """Function responsible for generating final query"""
+        API_KEY = self.config['llm']['OPENAI_API_KEY']
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": API_KEY,
+        }
+        
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You are an AI assistant that writes accurate OLAP cube queries based on given query."
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": final_prompt
+                        }
+                    ]
+                }
+            ],
+            "temperature": self.config['llm']['temperature'],
+            "top_p": self.config['llm']['top_p'],
+            "max_tokens": self.config['llm']['max_tokens']
+        }
+        
+        ENDPOINT = self.config['llm']['ENDPOINT']
+        
+        try:
+            response = requests.post(ENDPOINT, headers=headers, json=payload)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise SystemExit(f"Failed to make the request. Error: {e}")
+        
+        output = response.json()
+        token_details = output['usage']
+        output = output["choices"][0]["message"]["content"]
+        return output, token_details
+
+    def generate_query(self, query: str, dimensions: str, measures: str, prev_conv: dict, cube_name: str) -> str:
+        try:
+            if not dimensions or not measures:
+                raise ValueError("Both dimensions and measures are required to generate a query.")
+            
+            # Use Prompt-based function selection (more precise)
+            dynamic_functions = self.functions_manager.build_dynamic_functions_section(query)
+            logging.info(f"QUERY_GENERATION_FUNCTIONS - Dynamic functions loaded using prompt-based selection")
+                
+            final_prompt = f"""You are an expert in generating SQL Cube query. You will be provided dimensions delimited by $$$$ and measures delimited by &&&&.
+            Your Goal is to generate a precise single line cube query for the user query delimited by ####.
+
+            Instructions:            
+            - Generate a single-line Cube query without line breaks
+            - Include 'as' aliases for all level names in double quotes. alias are always level names.
+            - Choose the most appropriate dimensions group names and level from dimensions delimited by $$$$ according to the query.
+            - Choose the most appropriate measures group names and level from measures delimited by &&&& according to the query.
+            - check the examples to learn about correct syntax, functions and filters which can be used according to the user query requirement.
+            - User Query could be a follow up query in a conversation, you will also be provided previous query, dimensions, measures, cube query. Generate the final query including the contexts from conversation as appropriate.
+
+            Formatting Rules:
+            - Dimensions format: [Dimension Group Name].[Dimension Level Name] as "Dimension Level Name"
+            - Measures format: [Measure Group Name].[Measure Level Name] as "Measure Level Name"
+            - Conditions in WHERE clause must be properly formatted with operators
+            - For multiple conditions, use "and" "or" operators
+            - All string values in conditions must be in single quotes
+            - All numeric values should not have leading zeros
+            
+            {dynamic_functions}
+
+            <examples>
+
+            user query:What is the Total Revenue and Total Revenue From Operations Between the year 2012 to 2017?
+            Expected Response:-select [Time].[Year] as "Year", [Financial Data].[Total Revenue] as "Total Revenue", [Financial Data].[Total Revenue From Operations] as "Total Revenue From Operations",TimeBetween(20120101,20171231,[Time].[Year], false) from [Cube].[{cube_name}]
+	    
+	    user query:Mutual Fund Name wise Trade Price & Quantity ?
+  	    Expected Response:select [Mutual Fund Investment].[Mutual Fund Name] as "Mutual Fund Name", [Bulk Deal Trade].[Trade Price] as "Trade Price", [Bulk Deal Trade].[Traded Quantity] as "Traded Quantity" from [Cube].[{cube_name}]
+
+            user query:-Which months has the value of balance average amount between 40,00,00,000 to 2,00,00,00,000 ?           
+            Expected Response:-select [Time].[Month] as "Month", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Balance Amount Average] between 400000000.00 and 2000000000.00
+
+            user query:-Top 5 Cities on Average Balance Amount.
+            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average",Head([Branch Details].[City],[Business Drivers].[Balance Amount Average],5,undefined) from [Cube].[{cube_name}]
+
+            user query:-Please provide Cities and Average Balance Amount where Average Balance Amount is more than 5000 and Count of Customers more than 10.
+            Expected Response:-select [Branch Details].[City] as "City", [Business Drivers].[Balance Amount Average] as "Balance Amount Average" from [Cube].[{cube_name}] where [Business Drivers].[Count of Customers] > 10.00 and [Business Drivers].[Balance Amount Average] > 5000.00
+
+            user query:-what is the count of customers based on rating ?
+            Expected Response:-select [External Funding].[Rating] as "Rating", [Business Drivers].[Count of Customers] as "Count of Customers" from [Cube].[{cube_name}]
+
+            user query:-Please provide Year and Average Balance Amount and % change from previous year for past 2 years
+            Expected Response:-select [Time].[Year
